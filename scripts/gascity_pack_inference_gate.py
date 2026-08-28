@@ -104,6 +104,8 @@ GASTOWN_FORMULA_CONTRACTS = {
 }
 GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
     "mol-polecat-work": (
+        "metadata.work_dir // empty",
+        "cd \"$WORK_DIR\"",
         "EXPECTED_BRANCH=\"polecat/$WORK_BEAD_ID\"",
         "{{typecheck_command}}",
         "{{lint_command}}",
@@ -114,6 +116,8 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "--set-metadata target={{base_branch}}",
         "--status=open --assignee=\"$REFINERY_TARGET\"",
         "gc session wake \"$REFINERY_TARGET\"",
+        "gc hook current --id-only",
+        "gc bd close \"$SUBMIT_STEP_ID\"",
         "gc runtime drain-ack",
     ),
     "mol-refinery-patrol": (

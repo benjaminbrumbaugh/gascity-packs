@@ -297,9 +297,17 @@ needs = ["self-review"]
 description = """
 Hand off your work and self-clean. You cease to exist after this step.
 
-**1. Branch-shape gate (fails closed — non-negotiable).**
+**1. Recover the task worktree, then run the branch-shape gate
+(fails closed — non-negotiable).**
 
-Before anything else, verify you are on a per-bead branch. The refinery
+Formula steps may resume in a fresh provider process whose current directory
+is the reusable agent-home worktree. Shell working directories also do not
+persist between tool calls. Before any submit command, recover
+`metadata.work_dir`, set the shell/tool working directory to it, and keep every
+remaining command in this step scoped there. Never infer the task worktree
+from the current directory.
+
+Then verify you are on a per-bead branch. The refinery
 merges the branch recorded in your bead's `metadata.branch`, which must
 follow the `polecat/<bead-id>` convention; if you push from a different
 branch (your agent home branch, a stray local checkout, etc.), the
@@ -309,6 +317,16 @@ handoff contract is broken and the bead is permanently stranded as
 ```bash
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+WORK_DIR=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
+if [ -z "$WORK_DIR" ] || [ ! -d "$WORK_DIR" ]; then
+    echo "TASK WORKTREE RECOVERY FAILED"
+    echo "  work bead: $WORK_BEAD_ID"
+    echo "  metadata.work_dir: ${WORK_DIR:-<empty>}"
+    echo "Refusing to push or hand off from the reusable agent-home worktree."
+    gc runtime drain-ack
+    exit 1
+fi
+cd "$WORK_DIR"
 CURRENT_BRANCH=$(git branch --show-current)
 EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"
 if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
@@ -459,8 +477,15 @@ starts a stopped on_demand session; nudge leaves a visible prompt for a running
 one as soon as it is ready for input. Failure is non-fatal: the refinery finds
 the work on its next poll.
 
-**8. Signal reconciler and exit.**
+**8. Close this formula step, then signal the reconciler and exit.**
+
+`gc runtime drain-ack` may terminate the provider process immediately. Close
+the currently claimed submit step first so workflow-finalize becomes ready;
+otherwise the source task can remain open forever even after a successful
+handoff.
 ```bash
+SUBMIT_STEP_ID="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-$(gc hook current --id-only)}}"
+gc bd close "$SUBMIT_STEP_ID" --reason "Branch pushed and work handed to refinery"
 gc runtime drain-ack
 exit
 ```

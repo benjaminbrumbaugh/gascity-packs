@@ -1145,6 +1145,24 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     assert "gc bd dep add" in contracts["mol-idea-to-plan"]
 
 
+def test_polecat_submit_recovers_worktree_and_closes_step_before_drain() -> None:
+    formula = (
+        gascity_pack_inference_gate.PACK_SPECS["gastown"].source
+        / "formulas"
+        / "mol-polecat-work.toml"
+    ).read_text(encoding="utf-8")
+    submit = formula.split('id = "submit-and-exit"', 1)[1]
+
+    worktree_lookup = submit.index("metadata.work_dir // empty")
+    worktree_enter = submit.index('cd "$WORK_DIR"')
+    branch_gate = submit.index("CURRENT_BRANCH=$(git branch --show-current)")
+    close_step = submit.index('gc bd close "$SUBMIT_STEP_ID"')
+    drain = submit.rindex("gc runtime drain-ack")
+
+    assert worktree_lookup < worktree_enter < branch_gate
+    assert close_step < drain
+
+
 def test_build_basic_work_item_targets_code_and_pytest() -> None:
     text = gascity_pack_inference_gate.build_basic_work_item()
 
