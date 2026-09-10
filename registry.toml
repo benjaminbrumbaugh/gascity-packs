@@ -124,6 +124,13 @@ schema = 1
     hash = "sha256:7c8b13a608a9579ce62b7ec1c3bd0c6514f9abfcd61c7a48f90fd2abfb96f7b4"
     description = "Harden candidate-review repair against unsafe paths, stale claims, and non-fast-forward publication."
 
+  [[pack.release]]
+    version = "0.1.12"
+    ref = "main"
+    commit = "f63fdca33aed04394cfdecb7ce61086ed71af32e"
+    hash = "sha256:3306a72de72f34bd995db57f5f28ad288fb5410fd5c62636a6219bc758ef761b"
+    description = "Disable unsafe unattended candidate-review repair while its generation-task replacement is completed."
+
 [[pack]]
   name = "cass"
   description = "Coding Agent Session Search prompt fragments and skill overlays for Gas City."
