@@ -1,0 +1,93 @@
+description = """
+Repair one explicitly declared mechanical candidate-review hold.
+
+This formula is owned by the Gas Town pack. The SDK supplies durable beads,
+atomic claim preconditions, formula routing, and event visibility; it does not
+decide whether a review comment is actionable. The source bead must carry the
+complete `gc.candidate_review_*` contract and the order must have selected it.
+"""
+formula = "mol-candidate-review-repair"
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars]
+[vars.bead_id]
+description = "Source candidate-review bead selected by the pack order"
+required = true
+
+[vars.repair_script]
+description = "Absolute path to the pack's mechanical repair worker"
+required = true
+
+[vars.setup_command]
+description = "Optional configured setup gate"
+default = ""
+
+[vars.typecheck_command]
+description = "Optional configured typecheck gate"
+default = ""
+
+[vars.lint_command]
+description = "Optional configured lint gate"
+default = ""
+
+[vars.test_command]
+description = "Optional configured test gate"
+default = ""
+
+[vars.build_command]
+description = "Optional configured build gate"
+default = ""
+
+[[steps]]
+id = "repair-candidate-review"
+title = "Apply the declared correction and publish a repaired candidate"
+description = """
+Work only on source bead `{{bead_id}}`. The pack order selected this bead
+because it explicitly declared `gc.candidate_review_hold_class=mechanical`.
+Human, external, foreign, uncertain, malformed, or missing-contract holds are
+fail-closed and must remain untouched.
+
+First claim the source bead atomically and read its metadata:
+
+```bash
+BEAD_ID='{{bead_id}}'
+gc bd update "$BEAD_ID" --claim
+gc bd show "$BEAD_ID" --json | jq '.[0] | {id, status, assignee, metadata}'
+```
+
+The correction owner is the exact value in
+`gc.candidate_review_owner`; it must match the configured repair route. The
+exact correction is the value in `gc.candidate_review_correction`. Do not
+invent additional fixes. Record a clean-worktree baseline before making the
+correction. If the worktree is dirty, or the owner/route/target/source fields
+are missing or disagree, stop and preserve it.
+
+Apply only that correction in the recorded candidate worktree, commit the
+agent-authored correction, and leave the explicitly listed residue and
+already-landed paths for the mechanical worker. Do not stage foreign files.
+Then run the worker below. It validates relative paths, rebases onto the
+freshly fetched current target, runs every non-empty configured gate, pushes
+with a lease, records the candidate SHA and gate evidence, and resubmits the
+source bead through the explicit review route:
+
+```bash
+export GC_CANDIDATE_REPAIR_SETUP_COMMAND="{{setup_command}}"
+export GC_CANDIDATE_REPAIR_TYPECHECK_COMMAND="{{typecheck_command}}"
+export GC_CANDIDATE_REPAIR_LINT_COMMAND="{{lint_command}}"
+export GC_CANDIDATE_REPAIR_TEST_COMMAND="{{test_command}}"
+export GC_CANDIDATE_REPAIR_BUILD_COMMAND="{{build_command}}"
+'{{repair_script}}' "$BEAD_ID"
+```
+
+The worker is bounded by `gc.candidate_review_max_attempts` and leaves
+`repair_failed`, `exhausted`, or `published_pending_review` evidence when it
+cannot safely proceed. A successful run ends in `resubmitted`; do not wait for
+the same hold author inside this repair step.
+"""
+metadata = { "gc.candidate_review_repair" = "true", "gc.output_json_schema" = "candidate-review-repair.v1" }
+
+[steps.retry]
+max_attempts = 3
+on_exhausted = "hard_fail"

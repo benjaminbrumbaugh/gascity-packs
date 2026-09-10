@@ -216,6 +216,36 @@ if verify >= metadata:
 PY
 }
 
+test_candidate_review_repair_is_bounded_and_fail_closed() {
+    local order formula router worker
+    order="$GASTOWN/orders/candidate-review-repair.toml"
+    formula="$GASTOWN/formulas/mol-candidate-review-repair.toml"
+    router="$GASTOWN/assets/scripts/candidate-review-repair.sh"
+    worker="$GASTOWN/assets/scripts/candidate-review-repair-worker.sh"
+
+    [[ -x "$router" && -x "$worker" ]] ||
+        fail "candidate-review repair scripts must be executable"
+    parse_toml "$order" "$formula"
+    bash -n "$router" "$worker" ||
+        fail "candidate-review repair scripts must parse"
+    grep -F 'interval = "1m"' "$order" >/dev/null ||
+        fail "candidate-review repair must run as a bounded cooldown order"
+    grep -F 'hold_class=mechanical' "$formula" >/dev/null ||
+        fail "candidate-review repair formula must require an explicit mechanical hold"
+    grep -F 'gc.candidate_review_max_attempts' "$router" >/dev/null ||
+        fail "candidate-review repair must enforce a finite attempt budget"
+    grep -F -- '--if-status "$status" --if-assignee "$assignee"' "$router" >/dev/null ||
+        fail "candidate-review repair must use a status-and-owner CAS claim"
+    grep -F 'candidate worktree is dirty; preserving foreign or uncertain work' "$worker" >/dev/null ||
+        fail "candidate-review repair must preserve dirty or uncertain work"
+    grep -F -- '--force-with-lease="refs/heads/$SOURCE_BRANCH:$REMOTE_BEFORE"' "$worker" >/dev/null ||
+        fail "candidate publication must be fenced by the exact observed remote head"
+    grep -F 'target moved during repair; candidate was not published' "$worker" >/dev/null ||
+        fail "candidate publication must stop when the target moves"
+    grep -F 'no configured repair gates were supplied' "$worker" >/dev/null ||
+        fail "candidate repair must refuse publication without configured gates"
+}
+
 test_prime_prompts_are_city_generic_and_compact() {
     local mayor propulsion awareness
     mayor="$GASTOWN/agents/mayor/prompt.template.md"
@@ -254,5 +284,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_candidate_review_repair_is_bounded_and_fail_closed
 
 echo "gastown pack asset tests passed"

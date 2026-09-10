@@ -45,3 +45,17 @@ Gastown deliberately does not ship retired dog formulas for JSONL export or
 stale-session reaping. The Gas City builtin core pack provides JSONL export,
 stale-session and stale-data cleanup, and Dolt housekeeping as deterministic
 exec orders.
+
+## Candidate-review repair
+
+The `candidate-review-repair` order runs once per minute in each rig and only
+selects review holds that explicitly declare a complete
+`gc.candidate_review_*` contract with `hold_class=mechanical`. It atomically
+claims one writer, routes the declared correction through
+`mol-candidate-review-repair`, rebases onto a freshly fetched target, runs the
+configured gates, publishes with an exact remote lease, and resubmits review.
+
+The loop is intentionally fail-closed. Human or external decisions, missing
+ownership or routes, dirty worktrees, ambiguous paths, failed gates, and moved
+targets remain held with durable evidence. Operators must never classify an
+uncertain correction as mechanical merely to clear a queue.
