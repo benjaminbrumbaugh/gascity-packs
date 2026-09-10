@@ -15,6 +15,11 @@
 #   rigs[].pack    → expands rig agents only (witness, refinery, polecat)
 #
 # Crew members are individually named and declared inline in city.toml.
+#
+# Candidate-review repair is opt-in and fail-closed. Only a source bead with a
+# complete gc.candidate_review_* contract and hold_class="mechanical" may enter
+# the bounded repair order. Human, external, foreign, uncertain, and incomplete
+# holds remain untouched.
 
 [pack]
 name = "gastown"

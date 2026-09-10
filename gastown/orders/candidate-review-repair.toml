@@ -1,0 +1,7 @@
+[order]
+description = "Route explicitly declared mechanical candidate-review holds through bounded repair"
+scope = "rig"
+trigger = "cooldown"
+interval = "1m"
+timeout = "300s"
+exec = "$PACK_DIR/assets/scripts/candidate-review-repair.sh"

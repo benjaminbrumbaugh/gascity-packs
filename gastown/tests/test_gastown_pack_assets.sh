@@ -216,6 +216,61 @@ if verify >= metadata:
 PY
 }
 
+test_candidate_review_repair_is_bounded_and_fail_closed() {
+    local order formula router worker
+    order="$GASTOWN/orders/candidate-review-repair.toml"
+    formula="$GASTOWN/formulas/mol-candidate-review-repair.toml"
+    router="$GASTOWN/assets/scripts/candidate-review-repair.sh"
+    worker="$GASTOWN/assets/scripts/candidate-review-repair-worker.sh"
+
+    [[ -x "$router" ]] || fail "candidate-review repair router must be executable"
+    [[ -x "$worker" ]] || fail "candidate-review repair worker must be executable"
+    parse_toml "$order" "$formula"
+    bash -n "$router" "$worker" || fail "candidate-review repair scripts must parse"
+    grep -F 'interval = "1m"' "$order" >/dev/null ||
+        fail "candidate-review repair must run as a bounded cooldown order"
+    grep -F 'gc.candidate_review_hold_class=mechanical' "$formula" >/dev/null ||
+        fail "candidate-review repair formula must require an explicit mechanical hold"
+    grep -F 'new_claim_nonce' "$router" >/dev/null ||
+        fail "candidate-review repair claims must use a unique nonce"
+    ! grep -F '$RANDOM' "$router" >/dev/null ||
+        fail "candidate-review repair claims must not use a low-entropy nonce"
+    grep -F 'claim_still_owns_contract' "$router" >/dev/null ||
+        fail "candidate-review repair must recheck the complete claim contract"
+    grep -F 'hold_class)" = "mechanical"' "$router" >/dev/null ||
+        fail "candidate-review repair must route only mechanical holds"
+    grep -F 'max_attempts = 1' "$formula" >/dev/null ||
+        fail "formula must not duplicate delivery attempts"
+    ! grep -F '[vars.bead_id]' "$formula" >/dev/null ||
+        fail "candidate-review repair formula must not declare a legacy source-bead variable"
+    grep -F 'decode_path_list' "$worker" >/dev/null ||
+        fail "candidate-review worker must decode and validate path metadata"
+    grep -F 'control-character' "$worker" >/dev/null ||
+        fail "candidate-review worker must reject control-character paths"
+    grep -F 'has_symlink_component' "$worker" >/dev/null ||
+        fail "candidate-review worker must reject symlink path escapes"
+    grep -F 'mktemp "$LOCK_ROOT/.writer.XXXXXX"' "$worker" >/dev/null ||
+        fail "candidate-review worker must use a unique repository writer lock"
+    grep -F 'git cat-file -t "$TARGET_REF:$prefix"' "$worker" >/dev/null ||
+        fail "candidate-review worker must inspect every target path ancestor"
+    grep -F 'CURRENT_BEAD="$(read_bead)"' "$worker" >/dev/null ||
+        fail "candidate-review worker must revalidate before mutation"
+    grep -F 'git add -A -- "$path"' "$worker" >/dev/null ||
+        fail "candidate-review worker must stage only declared paths"
+    grep -F 'git push origin "HEAD:refs/heads/$SOURCE_BRANCH"' "$worker" >/dev/null ||
+        fail "candidate-review worker must publish the declared source branch"
+    grep -F 'normal fast-forward' "$worker" >/dev/null ||
+        fail "candidate-review worker must require normal fast-forward publication"
+    grep -F 'run_gate diff-check "git diff --check"' "$worker" >/dev/null ||
+        fail "candidate-review worker must own the mandatory diff check"
+    grep -F 'operator-configured gate' "$formula" >/dev/null ||
+        fail "candidate-review formula must document operator-owned gates"
+    grep -F 'trusted current worktree' "$formula" >/dev/null ||
+        fail "candidate-review formula must bind the trusted formula worktree"
+    ! grep -F 'gc.candidate_review_test_command' "$router" >/dev/null ||
+        fail "candidate-review router must not execute bead-supplied gates"
+}
+
 test_prime_prompts_are_city_generic_and_compact() {
     local mayor propulsion awareness
     mayor="$GASTOWN/agents/mayor/prompt.template.md"
@@ -254,5 +309,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_candidate_review_repair_is_bounded_and_fail_closed
 
 echo "gastown pack asset tests passed"
