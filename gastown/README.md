@@ -51,16 +51,16 @@ exec orders.
 The `candidate-review-repair` order runs once per minute in each rig and only
 selects review holds that explicitly declare a complete
 `gc.candidate_review_*` contract with `hold_class=mechanical`. It atomically
-allocates one generation through exact metadata CAS, creates or reconciles a
-separate child task by deterministic external reference, and routes that task
-through the fixed `mol-candidate-review-repair` Graph v2 formula. The source
-bead keeps its business owner and is never reassigned.
+claims one repair attempt with a unique CAS token and routes the source bead
+through the fixed `mol-candidate-review-repair` Graph v2 formula. The formula
+binds the worker to its trusted current worktree and declared source branch;
+the worker stages only declared paths.
 
 The loop is intentionally fail-closed. Human or external decisions, missing
-ownership or routes, changed contracts, CAS conflicts, ambiguous task creation,
-and exhausted dispatches remain held with durable evidence. The delivery agent
-uses an isolated worktree and the repository's normal tested branch, PR,
-independent-review, merge, release, provenance, and real-consumer verification
-boundaries. Only then may it atomically mark the source generation delivered.
-Operators must never classify an uncertain correction as mechanical merely to
-clear a queue.
+ownership or routes, malformed or symlink paths, changed contracts, CAS
+conflicts, dirty worktrees, writer-lock conflicts, non-fast-forward races, and
+exhausted attempts remain held with durable evidence. The worker always runs
+its mandatory `git diff --check` and then any non-empty operator-owned gates,
+publishes only through a normal fast-forward, and resubmits the source bead
+through its explicit review route. Operators must never classify an uncertain
+correction as mechanical merely to clear a queue.

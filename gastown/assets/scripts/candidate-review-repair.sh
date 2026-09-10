@@ -1,198 +1,322 @@
 #!/usr/bin/env bash
-# candidate-review-repair — allocate durable repair tasks for mechanical holds.
+# candidate-review-repair — route explicit mechanical review holds.
 #
-# This coordinator never edits Git state, reassigns the source bead, or runs
-# bead-authored commands. One exact metadata CAS allocates a generation; a
-# deterministic external reference makes task creation crash-convergent.
+# This is Gas Town pack policy, not SDK decision logic. A bead is eligible only
+# when its owner has persisted an exact correction, both repair/review routes,
+# source/target identity, configured gates, and hold_class=mechanical. All other
+# holds are deliberately untouched. A unique temporary assignee is the CAS
+# token that prevents concurrent order executions from dispatching twice.
 set -euo pipefail
 
 if ! command -v jq >/dev/null 2>&1; then
     echo "candidate-review-repair: jq is required" >&2
     exit 1
 fi
-if [ -z "${GC_RIG:-}" ] || ! [[ "$GC_RIG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-    echo "candidate-review-repair: a path-safe GC_RIG is required" >&2
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKER="$SCRIPT_DIR/candidate-review-repair-worker.sh"
+if [ ! -x "$WORKER" ]; then
+    echo "candidate-review-repair: worker is missing or not executable: $WORKER" >&2
     exit 1
 fi
 
-STORE_REF="rig:$GC_RIG"
-CONTROL_KEY="gc.candidate_review_control"
-WORKFLOW="mol-candidate-review-repair"
+BEADS_JSON=""
+if ! BEADS_JSON="$(gc bd query --json --limit=0 'status!=closed')"; then
+    echo "candidate-review-repair: unable to query open candidate holds" >&2
+    exit 1
+fi
+if ! printf '%s' "$BEADS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    echo "candidate-review-repair: gc bd query returned malformed JSON" >&2
+    exit 1
+fi
 
 read_meta() {
-    printf '%s' "$1" | jq -r --arg key "$2" '.metadata[$key] // empty'
+    local bead_json="$1" key="$2"
+    printf '%s' "$bead_json" | jq -r --arg key "$key" '.metadata[$key] // empty'
 }
 
-all_beads() {
-    local result
-    result="$(gc bd list --all --limit=0 --json)" || return 1
-    printf '%s' "$result" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
-    printf '%s' "$result"
+new_claim_nonce() {
+    local nonce
+    nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')" || return 1
+    [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s' "$nonce"
 }
 
-metadata_cas() {
-    local id="$1" expected="$2" next="$3" result
-    result="$(gc beads metadata-cas "$id" --store-ref "$STORE_REF" \
-        --key "$CONTROL_KEY" --expected "$expected" --next "$next" --json)" || return 1
-    printf '%s' "$result" | jq -r '.outcome // empty'
+has_valid_path_contract() {
+    local bead_json="$1"
+    printf '%s' "$bead_json" | jq -e '
+        def decode_path_list:
+            if type == "array" then .
+            elif type == "string" then (try fromjson catch null)
+            else null
+            end;
+        .metadata as $metadata |
+        ($metadata["gc.candidate_review_residue"]? // null | decode_path_list) as $residue |
+        ($metadata["gc.candidate_review_landed"]? // null | decode_path_list) as $landed |
+        ($residue | type == "array" and all(.[];
+            type == "string" and length > 0 and
+            (explode | all(.[]; . >= 32 and . != 127)) and
+            (startswith("/") | not) and
+            (endswith("/") | not) and
+            ((split("/")) as $parts | all($parts[]; . != "" and . != "." and . != "..")) and
+            . != ".git" and (startswith(".git/") | not)
+        )) and
+        ($landed | type == "array" and all(.[];
+            type == "string" and length > 0 and
+            (explode | all(.[]; . >= 32 and . != 127)) and
+            (startswith("/") | not) and
+            (endswith("/") | not) and
+            ((split("/")) as $parts | all($parts[]; . != "" and . != "." and . != "..")) and
+            . != ".git" and (startswith(".git/") | not)
+        )) and
+        ((($residue + $landed) | unique | length) == (($residue + $landed) | length))
+    ' >/dev/null 2>&1
 }
 
-find_task() {
-    local inventory="$1" external_ref="$2"
-    printf '%s' "$inventory" | jq -c --arg ref "$external_ref" \
-        '[.[] | select((.external_ref // "") == $ref)]'
+claim_still_owns_contract() {
+    local before="$1" after="$2" token="$3" expected_state="${4:-queued}"
+    jq -n -e --arg token "$token" --arg expected_state "$expected_state" \
+        --argjson before "$before" --argjson after "$after" '
+        ($after.id == $before.id) and
+        ($after.status == "in_progress") and
+        ($after.assignee == $token) and
+        ($after.metadata["gc.candidate_review_hold_class"] == "mechanical") and
+        ($after.metadata["gc.candidate_review_state"] == $expected_state) and
+        ($after.metadata["gc.candidate_review_token"] == $token) and
+        ([
+            "gc.candidate_review_correction",
+            "gc.candidate_review_owner",
+            "gc.candidate_review_repair_route",
+            "gc.candidate_review_repair_workflow",
+            "gc.candidate_review_review_route",
+            "gc.candidate_review_target",
+            "gc.candidate_review_source",
+            "gc.candidate_review_residue",
+            "gc.candidate_review_landed"
+        ] | all(.[]; $after.metadata[.] == $before.metadata[.]))
+    ' >/dev/null 2>&1
 }
 
-route_generation() {
-    local source="$1" source_id control state generation external_ref route review_route correction correction_b64
-    local source_branch target_branch
-    local next_control inventory matches count task_id task route_seen outcome metadata created dispatch_attempt dispatch_limit
-    source_id="$(printf '%s' "$source" | jq -r '.id // empty')"
-    control="$(read_meta "$source" "$CONTROL_KEY")"
-    state=""
-    if [ -n "$control" ]; then
-        state="$(printf '%s' "$control" | jq -r '.state // empty' 2>/dev/null || true)"
-    fi
+is_stale() {
+    local timestamp="$1" max_age="${GC_CANDIDATE_REPAIR_STALE_SECONDS:-900}"
+    [[ "$max_age" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s' "$timestamp" | jq -eR --argjson max_age "$max_age" '
+        (try fromdateiso8601 catch 0) as $then |
+        $then > 0 and (now - $then) >= $max_age
+    ' >/dev/null 2>&1
+}
 
-    [ "$(read_meta "$source" gc.candidate_review_state)" = "actionable" ] || return 0
-    [ "$(read_meta "$source" gc.candidate_review_hold_class)" = "mechanical" ] || return 0
-    route="$(read_meta "$source" gc.candidate_review_repair_route)"
-    review_route="$(read_meta "$source" gc.candidate_review_review_route)"
-    correction="$(read_meta "$source" gc.candidate_review_correction)"
-    source_branch="$(read_meta "$source" gc.candidate_review_source)"
-    target_branch="$(read_meta "$source" gc.candidate_review_target)"
-    [ -n "$source_id" ] && [[ "$source_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || return 0
-    [ -n "$correction" ] && [ "${#correction}" -le 8192 ] || return 0
-    [[ "$route" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
-    [[ "$review_route" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
-    [ "$(read_meta "$source" gc.candidate_review_owner)" = "$route" ] || return 0
-    [ "$review_route" != "$route" ] || return 0
-    [[ "$source_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
-    [[ "$target_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
-    git check-ref-format --branch "$source_branch" >/dev/null 2>&1 || return 0
-    git check-ref-format --branch "$target_branch" >/dev/null 2>&1 || return 0
-    [ "$source_branch" != "$target_branch" ] || return 0
-    correction_b64="$(jq -rn --arg value "$correction" '$value | @base64')"
+fresh_guarded_update() {
+    local id="$1" token="$2"
+    shift 2
+    local fresh fresh_token status assignee hold_class state
+    fresh="$(gc bd show "$id" --json)" || return 1
+    fresh_token="$(printf '%s' "$fresh" | jq -r '.[0].metadata["gc.candidate_review_token"] // empty')"
+    [ "$fresh_token" = "$token" ] || return 13
+    status="$(printf '%s' "$fresh" | jq -r '.[0].status // empty')"
+    assignee="$(printf '%s' "$fresh" | jq -r '.[0].assignee // empty')"
+    hold_class="$(printf '%s' "$fresh" | jq -r '.[0].metadata["gc.candidate_review_hold_class"] // empty')"
+    state="$(printf '%s' "$fresh" | jq -r '.[0].metadata["gc.candidate_review_state"] // empty')"
+    [ "$status" != "closed" ] || return 13
+    [ -n "$assignee" ] || return 13
+    [ "$hold_class" = "mechanical" ] || return 13
+    case "$state" in
+        queued|active|review_queued|published_pending_review) ;;
+        *) return 13 ;;
+    esac
+    gc bd update "$id" --if-status "$status" --if-assignee "$assignee" "$@"
+}
+
+route_review() {
+    local bead_json="$1" id status assignee state route timestamp claim_token output rc
+    id="$(printf '%s' "$bead_json" | jq -r '.id // empty')"
+    status="$(printf '%s' "$bead_json" | jq -r '.status // empty')"
+    assignee="$(printf '%s' "$bead_json" | jq -r '.assignee // empty')"
+    state="$(read_meta "$bead_json" gc.candidate_review_state)"
+    route="$(read_meta "$bead_json" gc.candidate_review_review_route)"
+    [ -n "$id" ] && [ -n "$assignee" ] && [ -n "$route" ] || return 0
+    [ "$(read_meta "$bead_json" gc.candidate_review_hold_class)" = "mechanical" ] || return 0
 
     case "$state" in
-        "")
-            generation="$(printf '%s' "$source_id:$(date -u +%s):$$:$RANDOM" | shasum -a 256 | cut -c1-24)"
-            external_ref="candidate-review-repair:$source_id:$generation"
-            next_control="$(jq -cn --arg generation "$generation" --arg external_ref "$external_ref" \
-                --arg route "$route" --arg review_route "$review_route" --arg source_branch "$source_branch" \
-                --arg target_branch "$target_branch" --arg correction_b64 "$correction_b64" \
-                '{schema:1,state:"allocating",generation:$generation,repair_attempt:1,repair_limit:1,dispatch_attempt:0,dispatch_limit:3,task_external_ref:$external_ref,repair_route:$route,review_route:$review_route,source_branch:$source_branch,target_branch:$target_branch,correction_b64:$correction_b64}')"
-            outcome="$(metadata_cas "$source_id" "" "$next_control")" || {
-                echo "candidate-review-repair: exact metadata CAS unavailable for $source_id; preserving hold" >&2
-                return 1
-            }
-            [ "$outcome" = "swapped" ] || return 0
-            control="$next_control"
-            state="allocating"
+        published_pending_review)
             ;;
-        allocating|routed|dispatching)
+        review_queued)
+            timestamp="$(read_meta "$bead_json" gc.candidate_review_review_queued_at)"
+            is_stale "$timestamp" || return 0
             ;;
         *)
             return 0
             ;;
     esac
 
-    generation="$(printf '%s' "$control" | jq -r '.generation // empty')"
-    external_ref="$(printf '%s' "$control" | jq -r '.task_external_ref // empty')"
-    route="$(printf '%s' "$control" | jq -r '.repair_route // empty')"
-    review_route="$(printf '%s' "$control" | jq -r '.review_route // empty')"
-    [ -n "$generation" ] && [ -n "$external_ref" ] && [ -n "$route" ] && [ -n "$review_route" ] || {
-        echo "candidate-review-repair: malformed control record for $source_id; preserving it" >&2
+    local nonce
+    nonce="$(new_claim_nonce)" || {
+        echo "candidate-review-repair: unable to create a unique review claim for $id" >&2
         return 1
     }
-    [ "$route" = "$(read_meta "$source" gc.candidate_review_repair_route)" ] && \
-        [ "$review_route" = "$(read_meta "$source" gc.candidate_review_review_route)" ] && \
-        [ "$(printf '%s' "$control" | jq -r '.source_branch // empty')" = "$source_branch" ] && \
-        [ "$(printf '%s' "$control" | jq -r '.target_branch // empty')" = "$target_branch" ] && \
-        [ "$(printf '%s' "$control" | jq -r '.correction_b64 // empty')" = "$correction_b64" ] || {
-        echo "candidate-review-repair: source contract changed for $source_id; preserving it" >&2
-        return 1
-    }
-
-    inventory="$(all_beads)" || {
-        echo "candidate-review-repair: cannot reconcile task inventory for $source_id" >&2
-        return 1
-    }
-    matches="$(find_task "$inventory" "$external_ref")"
-    count="$(printf '%s' "$matches" | jq 'length')"
-    if [ "$count" -gt 1 ]; then
-        echo "candidate-review-repair: ambiguous duplicate repair tasks for $source_id" >&2
-        return 1
-    fi
-    if [ "$count" -eq 0 ]; then
-        metadata="$(jq -cn --arg source "$source_id" --arg generation "$generation" \
-            '{"gc.candidate_review_source_ref":$source,"gc.candidate_review_generation":$generation}')"
-        if ! created="$(gc bd create --silent --parent "$source_id" --external-ref "$external_ref" \
-            --metadata "$metadata" --title "Repair candidate review hold: $source_id" \
-            --description "Execute the fixed Gas Town candidate-review repair workflow for source $source_id.")"; then
-            echo "candidate-review-repair: task creation outcome is ambiguous for $source_id; will reconcile before retry" >&2
-            return 1
-        fi
-        task_id="$(printf '%s' "$created" | tr -d '[:space:]')"
-        [ -n "$task_id" ] || return 1
+    claim_token="candidate-review:$id:$(date -u +%Y%m%dT%H%M%SZ):$nonce"
+    if gc bd update "$id" --if-status "$status" --if-assignee "$assignee" \
+        --status in_progress --assignee "$claim_token" \
+        --set-metadata gc.candidate_review_state=review_queued \
+        --set-metadata gc.candidate_review_token="$claim_token" \
+        --set-metadata gc.candidate_review_review_queued_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null; then
+        :
     else
-        task_id="$(printf '%s' "$matches" | jq -r '.[0].id // empty')"
-    fi
-
-    task="$(gc bd show "$task_id" --json | jq -c 'if type == "array" and length == 1 then .[0] else empty end')"
-    [ -n "$task" ] || return 1
-    if [ "$(read_meta "$task" gc.candidate_review_source_ref)" != "$source_id" ] || \
-        [ "$(read_meta "$task" gc.candidate_review_generation)" != "$generation" ]; then
-        echo "candidate-review-repair: task identity mismatch for $source_id; preserving it" >&2
+        rc=$?
+        [ "$rc" -eq 13 ] && return 0
+        echo "candidate-review-repair: failed to claim review handoff for $id (exit $rc)" >&2
         return 1
     fi
-
-    if [ "$state" = "allocating" ]; then
-        next_control="$(printf '%s' "$control" | jq -c '.state="routed"')"
-        outcome="$(metadata_cas "$source_id" "$control" "$next_control")" || return 1
-        case "$outcome" in
-            swapped|already_next) control="$next_control" ;;
-            conflict) return 0 ;;
-            *) return 1 ;;
-        esac
-    fi
-
-    route_seen="$(read_meta "$task" gc.execution_routed_to)"
-    if [ "$route_seen" = "$route" ]; then
+    local claimed
+    if ! claimed="$(gc bd show "$id" --json)" || ! claim_still_owns_contract \
+        "$(printf '%s' "$bead_json" | jq -c '.')" \
+        "$(printf '%s' "$claimed" | jq -c '.[0]')" "$claim_token" review_queued; then
+        echo "candidate-review-repair: review claim for $id changed before dispatch" >&2
         return 0
     fi
-    if [ -n "$(printf '%s' "$task" | jq -r '.assignee // empty')" ]; then
-        echo "candidate-review-repair: repair task $task_id has foreign ownership; preserving it" >&2
+    if ! output="$(gc sling "$route" "$id" --no-formula --reassign 2>&1)"; then
+        fresh_guarded_update "$id" "$claim_token" \
+            --set-metadata gc.candidate_review_state=published_pending_review \
+            --set-metadata gc.candidate_review_last_error="review handoff failed: $output" \
+            --append-notes "Candidate is durable; review handoff remains pending." >/dev/null || true
+        echo "candidate-review-repair: $id review handoff failed: $output" >&2
         return 1
     fi
-    dispatch_attempt="$(printf '%s' "$control" | jq -r '.dispatch_attempt // empty')"
-    dispatch_limit="$(printf '%s' "$control" | jq -r '.dispatch_limit // empty')"
-    [[ "$dispatch_attempt" =~ ^[0-9]$ && "$dispatch_limit" =~ ^[1-9]$ ]] || return 1
-    if [ "$dispatch_attempt" -ge "$dispatch_limit" ]; then
-        next_control="$(printf '%s' "$control" | jq -c '.state="dispatch_exhausted"')"
-        outcome="$(metadata_cas "$source_id" "$control" "$next_control")" || return 1
-        case "$outcome" in
-            swapped|already_next) ;;
-            conflict) return 0 ;;
-            *) return 1 ;;
-        esac
-        echo "candidate-review-repair: dispatch budget exhausted for $source_id" >&2
-        return 1
+    if ! fresh_guarded_update "$id" "$claim_token" \
+        --set-metadata gc.candidate_review_state=resubmitted \
+        --set-metadata gc.candidate_review_review_submitted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --unset-metadata gc.candidate_review_last_error >/dev/null; then
+        echo "candidate-review-repair: $id review was routed; newer ownership prevented stale evidence" >&2
     fi
-    next_control="$(printf '%s' "$control" | jq -c '.state="dispatching" | .dispatch_attempt += 1')"
-    outcome="$(metadata_cas "$source_id" "$control" "$next_control")" || return 1
-    [ "$outcome" = "swapped" ] || return 0
-    control="$next_control"
-    gc sling "$route" "$task_id" --on "$WORKFLOW" \
-        --var "source_ref=$source_id" --var "store_ref=$STORE_REF" \
-        --var "expected_control=$control" --var "review_route=$review_route" >/dev/null
+    echo "candidate-review-repair: resubmitted $id to $route"
 }
 
-SOURCES="$(gc bd query --json --limit=0 'status!=closed')" || {
-    echo "candidate-review-repair: unable to query candidate holds" >&2
-    exit 1
+route_repair() {
+    local bead_json="$1" id status assignee state timestamp owner correction route workflow review_route target source residue landed
+    local setup typecheck lint test_command build attempt max_attempts next claim_token output rc
+    id="$(printf '%s' "$bead_json" | jq -r '.id // empty')"
+    status="$(printf '%s' "$bead_json" | jq -r '.status // empty')"
+    assignee="$(printf '%s' "$bead_json" | jq -r '.assignee // empty')"
+    state="$(read_meta "$bead_json" gc.candidate_review_state)"
+
+    case "$state" in
+        actionable|repair_failed)
+            ;;
+        queued)
+            timestamp="$(read_meta "$bead_json" gc.candidate_review_repair_queued_at)"
+            is_stale "$timestamp" || return 0
+            ;;
+        active)
+            timestamp="$(read_meta "$bead_json" gc.candidate_review_started_at)"
+            is_stale "$timestamp" || return 0
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    [ "$status" = "open" ] || [ "$status" = "in_progress" ] || [ "$status" = "blocked" ] || return 0
+    [ -n "$id" ] && [ -n "$assignee" ] || return 0
+    [ "$(read_meta "$bead_json" gc.candidate_review_hold_class)" = "mechanical" ] || return 0
+    if ! has_valid_path_contract "$bead_json"; then
+        echo "candidate-review-repair: $id has malformed or unsafe declared paths; preserving hold" >&2
+        return 0
+    fi
+
+    owner="$(read_meta "$bead_json" gc.candidate_review_owner)"
+    correction="$(read_meta "$bead_json" gc.candidate_review_correction)"
+    route="$(read_meta "$bead_json" gc.candidate_review_repair_route)"
+    workflow="$(read_meta "$bead_json" gc.candidate_review_repair_workflow)"
+    review_route="$(read_meta "$bead_json" gc.candidate_review_review_route)"
+    target="$(read_meta "$bead_json" gc.candidate_review_target)"
+    source="$(read_meta "$bead_json" gc.candidate_review_source)"
+    residue="$(read_meta "$bead_json" gc.candidate_review_residue)"
+    landed="$(read_meta "$bead_json" gc.candidate_review_landed)"
+    # Gate commands are operator-owned process configuration, never bead data.
+    # A bead can request a repair but cannot inject an unattended shell command.
+    setup="${GC_CANDIDATE_REPAIR_SETUP_COMMAND:-}"
+    typecheck="${GC_CANDIDATE_REPAIR_TYPECHECK_COMMAND:-}"
+    lint="${GC_CANDIDATE_REPAIR_LINT_COMMAND:-}"
+    test_command="${GC_CANDIDATE_REPAIR_TEST_COMMAND:-git diff --check}"
+    build="${GC_CANDIDATE_REPAIR_BUILD_COMMAND:-}"
+    if [ -z "$owner" ] || [ "$owner" != "$route" ] || [ -z "$correction" ] || [ -z "$route" ] || \
+        [ -z "$workflow" ] || [ -z "$review_route" ] || [ -z "$target" ] || [ -z "$source" ] || \
+        [ -z "$residue" ] || [ -z "$landed" ]; then
+        echo "candidate-review-repair: $id missing or inconsistent explicit contract; preserving hold" >&2
+        return 0
+    fi
+
+    attempt="$(read_meta "$bead_json" gc.candidate_review_repair_attempt)"
+    max_attempts="$(read_meta "$bead_json" gc.candidate_review_max_attempts)"
+    attempt="${attempt:-0}"
+    max_attempts="${max_attempts:-3}"
+    if ! [[ "$attempt" =~ ^[0-9]+$ && "$max_attempts" =~ ^[1-9][0-9]*$ ]]; then
+        echo "candidate-review-repair: $id has invalid attempt budget; preserving hold" >&2
+        return 0
+    fi
+    if [ "$attempt" -ge "$max_attempts" ]; then
+        if gc bd update "$id" --if-status "$status" --if-assignee "$assignee" \
+            --set-metadata gc.candidate_review_state=exhausted \
+            --set-metadata gc.candidate_review_last_error="repair attempt budget exhausted ($attempt/$max_attempts)" >/dev/null; then
+            :
+        else
+            rc=$?
+            [ "$rc" -eq 13 ] || return 1
+        fi
+        echo "candidate-review-repair: exhausted $id after $attempt/$max_attempts attempts" >&2
+        return 0
+    fi
+    next=$((attempt + 1))
+    nonce="$(new_claim_nonce)" || {
+        echo "candidate-review-repair: unable to create a unique repair claim for $id" >&2
+        return 1
+    }
+    claim_token="candidate-repair:$id:$next:$(date -u +%Y%m%dT%H%M%SZ):$nonce"
+
+    if gc bd update "$id" --if-status "$status" --if-assignee "$assignee" \
+        --status in_progress --assignee "$claim_token" \
+        --set-metadata gc.candidate_review_state=queued \
+        --set-metadata gc.candidate_review_repair_attempt="$next" \
+        --set-metadata gc.candidate_review_token="$claim_token" \
+        --set-metadata gc.candidate_review_repair_queued_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --set-metadata gc.candidate_review_repair_owner="$owner" >/dev/null; then
+        :
+    else
+        rc=$?
+        [ "$rc" -eq 13 ] && return 0
+        echo "candidate-review-repair: failed to claim $id (exit $rc)" >&2
+        return 1
+    fi
+
+    local claimed
+    if ! claimed="$(gc bd show "$id" --json)" || ! claim_still_owns_contract \
+        "$(printf '%s' "$bead_json" | jq -c '.')" \
+        "$(printf '%s' "$claimed" | jq -c '.[0]')" "$claim_token"; then
+        echo "candidate-review-repair: repair claim for $id changed before dispatch" >&2
+        return 0
+    fi
+
+    if ! output="$(gc sling "$route" "$id" --on "$workflow" --reassign \
+        --var "repair_script=$WORKER" --var "repair_token=$claim_token" \
+        --var "setup_command=$setup" --var "typecheck_command=$typecheck" \
+        --var "lint_command=$lint" --var "test_command=$test_command" \
+        --var "build_command=$build" 2>&1)"; then
+        fresh_guarded_update "$id" "$claim_token" \
+            --set-metadata gc.candidate_review_state=repair_failed \
+            --set-metadata gc.candidate_review_last_error="repair dispatch failed: $output" \
+            --append-notes "Candidate repair dispatch failed; retry remains bounded." >/dev/null || true
+        echo "candidate-review-repair: $id dispatch failed: $output" >&2
+        return 1
+    fi
+    echo "candidate-review-repair: queued $id attempt $next via $route ($workflow)"
 }
-printf '%s' "$SOURCES" | jq -e 'type == "array"' >/dev/null 2>&1 || exit 1
-while IFS= read -r source; do
-    route_generation "$source"
-done < <(printf '%s' "$SOURCES" | jq -c '.[]')
+
+BEAD_LINES="$(printf '%s' "$BEADS_JSON" | jq -c '.[]')"
+while IFS= read -r bead_json; do
+    [ -n "$bead_json" ] || continue
+    state="$(read_meta "$bead_json" gc.candidate_review_state)"
+    case "$state" in
+        published_pending_review|review_queued) route_review "$bead_json" ;;
+        *) route_repair "$bead_json" ;;
+    esac
+done <<< "$BEAD_LINES"

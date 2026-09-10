@@ -224,45 +224,51 @@ test_candidate_review_repair_is_bounded_and_fail_closed() {
     worker="$GASTOWN/assets/scripts/candidate-review-repair-worker.sh"
 
     [[ -x "$router" ]] || fail "candidate-review repair router must be executable"
-    [[ ! -e "$worker" ]] || fail "unsafe candidate-review Git worker must stay deleted"
+    [[ -x "$worker" ]] || fail "candidate-review repair worker must be executable"
     parse_toml "$order" "$formula"
-    bash -n "$router" || fail "candidate-review repair router must parse"
+    bash -n "$router" "$worker" || fail "candidate-review repair scripts must parse"
     grep -F 'interval = "1m"' "$order" >/dev/null ||
         fail "candidate-review repair must run as a bounded cooldown order"
-    grep -F 'mechanical actionable hold' "$formula" >/dev/null ||
+    grep -F 'gc.candidate_review_hold_class=mechanical' "$formula" >/dev/null ||
         fail "candidate-review repair formula must require an explicit mechanical hold"
-    grep -F 'gc beads metadata-cas' "$router" >/dev/null ||
-        fail "candidate-review repair must allocate generations with exact metadata CAS"
-    grep -F 'task_external_ref' "$router" >/dev/null ||
-        fail "candidate-review repair must reconcile one durable child task"
-    grep -F 'dispatch_limit:3' "$router" >/dev/null ||
-        fail "candidate-review repair dispatch must have a finite attempt budget"
-    grep -F 'WORKFLOW="mol-candidate-review-repair"' "$router" >/dev/null ||
-        fail "candidate-review repair must pin the pack-owned workflow"
-    grep -F '"$review_route" != "$route"' "$router" >/dev/null ||
-        fail "candidate-review repair must use a distinct independent review route"
-    grep -F 'gc bd create --silent --parent' "$router" >/dev/null ||
-        fail "candidate-review repair must create a separate generation task"
+    grep -F 'new_claim_nonce' "$router" >/dev/null ||
+        fail "candidate-review repair claims must use a unique nonce"
+    ! grep -F '$RANDOM' "$router" >/dev/null ||
+        fail "candidate-review repair claims must not use a low-entropy nonce"
+    grep -F 'claim_still_owns_contract' "$router" >/dev/null ||
+        fail "candidate-review repair must recheck the complete claim contract"
+    grep -F 'hold_class)" = "mechanical"' "$router" >/dev/null ||
+        fail "candidate-review repair must route only mechanical holds"
     grep -F 'max_attempts = 1' "$formula" >/dev/null ||
         fail "formula must not duplicate delivery attempts"
     ! grep -F '[vars.bead_id]' "$formula" >/dev/null ||
         fail "candidate-review repair formula must not declare a legacy source-bead variable"
-    ! grep -F -- '--reassign' "$router" >/dev/null ||
-        fail "candidate-review repair must never reassign source or task ownership"
-    ! grep -E 'git (add|commit|merge|push|restore|worktree add)' "$router" >/dev/null ||
-        fail "candidate-review coordinator must not mutate Git state"
-    grep -F 'isolated worktree' "$formula" >/dev/null ||
-        fail "delivery must preserve existing checkouts in an isolated worktree"
-    grep -F 'git diff --check <target-oid> <candidate-oid>' "$formula" >/dev/null ||
-        fail "delivery must check the committed candidate range"
-    grep -F 'open or update a PR' "$formula" >/dev/null ||
-        fail "delivery must publish through a normal PR"
-    grep -F 'independent exact-byte review' "$formula" >/dev/null ||
-        fail "delivery must require independent exact-byte approval"
-    grep -F 'installed provenance plus the real' "$formula" >/dev/null ||
-        fail "delivery must verify release provenance and real consumer behavior"
-    grep -F -- '--expected ' "$formula" >/dev/null ||
-        fail "delivery completion must use an exact source-generation CAS"
+    grep -F 'decode_path_list' "$worker" >/dev/null ||
+        fail "candidate-review worker must decode and validate path metadata"
+    grep -F 'control-character' "$worker" >/dev/null ||
+        fail "candidate-review worker must reject control-character paths"
+    grep -F 'has_symlink_component' "$worker" >/dev/null ||
+        fail "candidate-review worker must reject symlink path escapes"
+    grep -F 'mktemp "$LOCK_ROOT/.writer.XXXXXX"' "$worker" >/dev/null ||
+        fail "candidate-review worker must use a unique repository writer lock"
+    grep -F 'git cat-file -t "$TARGET_REF:$prefix"' "$worker" >/dev/null ||
+        fail "candidate-review worker must inspect every target path ancestor"
+    grep -F 'CURRENT_BEAD="$(read_bead)"' "$worker" >/dev/null ||
+        fail "candidate-review worker must revalidate before mutation"
+    grep -F 'git add -A -- "$path"' "$worker" >/dev/null ||
+        fail "candidate-review worker must stage only declared paths"
+    grep -F 'git push origin "HEAD:refs/heads/$SOURCE_BRANCH"' "$worker" >/dev/null ||
+        fail "candidate-review worker must publish the declared source branch"
+    grep -F 'normal fast-forward' "$worker" >/dev/null ||
+        fail "candidate-review worker must require normal fast-forward publication"
+    grep -F 'run_gate diff-check "git diff --check"' "$worker" >/dev/null ||
+        fail "candidate-review worker must own the mandatory diff check"
+    grep -F 'operator-configured gate' "$formula" >/dev/null ||
+        fail "candidate-review formula must document operator-owned gates"
+    grep -F 'trusted current worktree' "$formula" >/dev/null ||
+        fail "candidate-review formula must bind the trusted formula worktree"
+    ! grep -F 'gc.candidate_review_test_command' "$router" >/dev/null ||
+        fail "candidate-review router must not execute bead-supplied gates"
 }
 
 test_prime_prompts_are_city_generic_and_compact() {
