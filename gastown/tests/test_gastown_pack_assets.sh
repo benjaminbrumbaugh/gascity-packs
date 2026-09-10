@@ -223,61 +223,44 @@ test_candidate_review_repair_is_bounded_and_fail_closed() {
     router="$GASTOWN/assets/scripts/candidate-review-repair.sh"
     worker="$GASTOWN/assets/scripts/candidate-review-repair-worker.sh"
 
-    [[ -x "$router" && -x "$worker" ]] ||
-        fail "candidate-review repair scripts must be executable"
+    [[ -x "$router" ]] || fail "candidate-review repair router must be executable"
+    [[ ! -e "$worker" ]] || fail "unsafe candidate-review Git worker must stay deleted"
     parse_toml "$order" "$formula"
-    bash -n "$router" "$worker" ||
-        fail "candidate-review repair scripts must parse"
+    bash -n "$router" || fail "candidate-review repair router must parse"
     grep -F 'interval = "1m"' "$order" >/dev/null ||
         fail "candidate-review repair must run as a bounded cooldown order"
-    grep -F 'hold_class=mechanical' "$formula" >/dev/null ||
+    grep -F 'mechanical actionable hold' "$formula" >/dev/null ||
         fail "candidate-review repair formula must require an explicit mechanical hold"
-    grep -F 'gc.candidate_review_max_attempts' "$router" >/dev/null ||
-        fail "candidate-review repair must enforce a finite attempt budget"
+    grep -F 'gc beads metadata-cas' "$router" >/dev/null ||
+        fail "candidate-review repair must allocate generations with exact metadata CAS"
+    grep -F 'task_external_ref' "$router" >/dev/null ||
+        fail "candidate-review repair must reconcile one durable child task"
+    grep -F 'dispatch_limit:3' "$router" >/dev/null ||
+        fail "candidate-review repair dispatch must have a finite attempt budget"
+    grep -F 'WORKFLOW="mol-candidate-review-repair"' "$router" >/dev/null ||
+        fail "candidate-review repair must pin the pack-owned workflow"
+    grep -F 'gc bd create --silent --parent' "$router" >/dev/null ||
+        fail "candidate-review repair must create a separate generation task"
     grep -F 'max_attempts = 1' "$formula" >/dev/null ||
-        fail "formula retries must not bypass the order-owned attempt budget"
-    grep -F '{{convoy_id}}' "$formula" >/dev/null ||
-        fail "candidate-review repair formula must use its Graph v2 convoy binding"
+        fail "formula must not duplicate delivery attempts"
     ! grep -F '[vars.bead_id]' "$formula" >/dev/null ||
         fail "candidate-review repair formula must not declare a legacy source-bead variable"
-    ! grep -F -- '--no-convoy' "$router" >/dev/null ||
-        fail "candidate-review repair routing must create the Graph v2 convoy binding"
-    ! grep -F -- '--var "bead_id=' "$router" >/dev/null ||
-        fail "candidate-review repair routing must not pass a legacy source-bead variable"
-    grep -F -- '--if-status "$status" --if-assignee "$assignee"' "$router" >/dev/null ||
-        fail "candidate-review repair must use a status-and-owner CAS claim"
-    grep -F -- '--status in_progress --assignee "$claim_token"' "$router" >/dev/null ||
-        fail "candidate-review repair CAS must change ownership to a unique claim token"
-    [[ $(grep -c 'gc.candidate_review_hold_class)" = "mechanical"' "$router") -ge 2 ]] ||
-        fail "repair and review routing must validate mechanical hold class before mutation"
-    grep -F 'candidate worktree is dirty; preserving foreign or uncertain work' "$worker" >/dev/null ||
-        fail "candidate-review repair must preserve dirty or uncertain work"
-    grep -F 'WORK_DIR="${GC_CANDIDATE_REPAIR_WORK_DIR:-}"' "$worker" >/dev/null ||
-        fail "candidate-review repair must bind Git mutation to the trusted formula worktree"
-    ! grep -F 'read_meta "$BEAD" gc.work_dir' "$worker" >/dev/null ||
-        fail "candidate-review repair must not trust a bead-supplied repository path"
-    grep -F 'LOCK_FILE="$LOCK_ROOT/writer"' "$worker" >/dev/null ||
-        fail "candidate-review repair must serialize all writers in one repository"
-    grep -F '(explode | all(.[]; . >= 32 and . != 127))' "$worker" >/dev/null ||
-        fail "candidate-review repair paths must reject control-character splitting"
-    grep -F 'has_symlink_component' "$worker" >/dev/null ||
-        fail "candidate-review repair paths must reject symlink escapes"
-    grep -F 'git add -A -- "$path"' "$worker" >/dev/null ||
-        fail "candidate-review repair must stage only declared paths"
-    ! grep -E '^[[:space:]]*git add -A[[:space:]]*$' "$worker" >/dev/null ||
-        fail "candidate-review repair must not stage the entire worktree"
-    grep -F 'git push origin "HEAD:refs/heads/$SOURCE_BRANCH"' "$worker" >/dev/null ||
-        fail "candidate publication must use a normal fast-forward push"
-    ! grep -F -- '--force' "$worker" >/dev/null ||
-        fail "candidate publication must never rewrite remote history"
-    grep -F 'target moved during repair; candidate was not published' "$worker" >/dev/null ||
-        fail "candidate publication must stop when the target moves"
-    grep -F 'test_command="${GC_CANDIDATE_REPAIR_TEST_COMMAND:-git diff --check}"' "$router" >/dev/null ||
-        fail "candidate repair must always receive an operator-owned default gate"
-    ! grep -E 'read_meta .*candidate_review_(setup|typecheck|lint|test|build)_command' "$router" >/dev/null ||
-        fail "candidate repair must not execute bead-authored gate commands"
-    grep -F 'no configured repair gates were supplied' "$worker" >/dev/null ||
-        fail "candidate repair must refuse publication without configured gates"
+    ! grep -F -- '--reassign' "$router" >/dev/null ||
+        fail "candidate-review repair must never reassign source or task ownership"
+    ! grep -E 'git (add|commit|merge|push|restore|worktree add)' "$router" >/dev/null ||
+        fail "candidate-review coordinator must not mutate Git state"
+    grep -F 'isolated worktree' "$formula" >/dev/null ||
+        fail "delivery must preserve existing checkouts in an isolated worktree"
+    grep -F 'git diff --check <target-oid> <candidate-oid>' "$formula" >/dev/null ||
+        fail "delivery must check the committed candidate range"
+    grep -F 'open or update a PR' "$formula" >/dev/null ||
+        fail "delivery must publish through a normal PR"
+    grep -F 'independent exact-byte review' "$formula" >/dev/null ||
+        fail "delivery must require independent exact-byte approval"
+    grep -F 'installed provenance plus the real' "$formula" >/dev/null ||
+        fail "delivery must verify release provenance and real consumer behavior"
+    grep -F -- '--expected ' "$formula" >/dev/null ||
+        fail "delivery completion must use an exact source-generation CAS"
 }
 
 test_prime_prompts_are_city_generic_and_compact() {
