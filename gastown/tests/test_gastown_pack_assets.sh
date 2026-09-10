@@ -248,7 +248,7 @@ test_candidate_review_repair_is_bounded_and_fail_closed() {
         fail "candidate-review repair must bind Git mutation to the trusted formula worktree"
     ! grep -F 'read_meta "$BEAD" gc.work_dir' "$worker" >/dev/null ||
         fail "candidate-review repair must not trust a bead-supplied repository path"
-    grep -F 'LOCK_DIR="$LOCK_ROOT/writer"' "$worker" >/dev/null ||
+    grep -F 'LOCK_FILE="$LOCK_ROOT/writer"' "$worker" >/dev/null ||
         fail "candidate-review repair must serialize all writers in one repository"
     grep -F '(explode | all(.[]; . >= 32 and . != 127))' "$worker" >/dev/null ||
         fail "candidate-review repair paths must reject control-character splitting"

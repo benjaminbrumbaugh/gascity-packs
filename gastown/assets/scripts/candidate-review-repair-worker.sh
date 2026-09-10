@@ -116,7 +116,7 @@ if [ -n "$(git status --porcelain=v1)" ]; then
     exit 1
 fi
 
-# Serialize all Git mutation for this source bead. A dead same-host owner can be
+# Serialize all Git mutation for this repository. A dead same-host owner can be
 # reclaimed; a live or remote-host owner is preserved rather than guessed dead.
 GIT_COMMON="$(git rev-parse --git-common-dir)"
 case "$GIT_COMMON" in /*) ;; *) GIT_COMMON="$WORK_TOP/$GIT_COMMON" ;; esac
@@ -124,28 +124,47 @@ GIT_COMMON="$(cd "$GIT_COMMON" && pwd -P)"
 LOCK_ROOT="$GIT_COMMON/gc-candidate-review-locks"
 # One writer per repository. Different beads may target the same worktree or
 # source branch, so a bead-scoped lock would not prevent cross-bead Git races.
-LOCK_DIR="$LOCK_ROOT/writer"
+LOCK_FILE="$LOCK_ROOT/writer"
+LOCK_TEMP="$LOCK_ROOT/.writer.$$.tmp"
+LOCK_HOST="$(hostname)"
 mkdir -p "$LOCK_ROOT"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    lock_host="$(cat "$LOCK_DIR/host" 2>/dev/null || true)"
-    lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-    if [ "$lock_host" = "$(hostname)" ] && [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
-        rm -rf -- "$LOCK_DIR"
-        mkdir "$LOCK_DIR" || {
+printf '%s\n%s\n%s\n' "$LOCK_HOST" "$$" "$EXPECTED_TOKEN" >"$LOCK_TEMP"
+if ! ln "$LOCK_TEMP" "$LOCK_FILE" 2>/dev/null; then
+    lock_host=""
+    lock_pid=""
+    lock_token=""
+    if [ -f "$LOCK_FILE" ]; then
+        {
+            IFS= read -r lock_host || true
+            IFS= read -r lock_pid || true
+            IFS= read -r lock_token || true
+        } <"$LOCK_FILE"
+    fi
+    if [ "$lock_host" = "$LOCK_HOST" ] && [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        rm -f -- "$LOCK_FILE"
+        if ! ln "$LOCK_TEMP" "$LOCK_FILE" 2>/dev/null; then
+            rm -f -- "$LOCK_TEMP"
             echo "candidate-review-repair-worker: repair lock could not be reclaimed" >&2
             exit 1
-        }
+        fi
     else
+        rm -f -- "$LOCK_TEMP"
         echo "candidate-review-repair-worker: another repair writer owns $BEAD_ID" >&2
         exit 1
     fi
 fi
-printf '%s\n' "$(hostname)" >"$LOCK_DIR/host"
-printf '%s\n' "$$" >"$LOCK_DIR/pid"
-printf '%s\n' "$EXPECTED_TOKEN" >"$LOCK_DIR/token"
+rm -f -- "$LOCK_TEMP"
 cleanup_lock() {
-    if [ "$(cat "$LOCK_DIR/token" 2>/dev/null || true)" = "$EXPECTED_TOKEN" ]; then
-        rm -rf -- "$LOCK_DIR"
+    local lock_host="" lock_pid="" lock_token=""
+    if [ -f "$LOCK_FILE" ]; then
+        {
+            IFS= read -r lock_host || true
+            IFS= read -r lock_pid || true
+            IFS= read -r lock_token || true
+        } <"$LOCK_FILE"
+    fi
+    if [ "$lock_host" = "$LOCK_HOST" ] && [ "$lock_pid" = "$$" ] && [ "$lock_token" = "$EXPECTED_TOKEN" ]; then
+        rm -f -- "$LOCK_FILE"
     fi
 }
 trap cleanup_lock EXIT INT TERM
