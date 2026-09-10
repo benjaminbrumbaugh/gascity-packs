@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 # candidate-review-repair-worker — deterministic git side of the pack loop.
 #
-# The model owns interpretation of the persisted exact correction. This worker
-# owns only the mechanical boundary after that correction is committed:
-# validated explicit paths, current-target rebase, configured gates, leased
-# push, and durable review handoff evidence.
+# The model owns only the persisted exact correction. This worker validates the
+# current repair token and repository boundary, serializes mutation in the Git
+# common directory, touches only explicit paths, integrates the current target,
+# runs configured gates, performs a normal fast-forward publication, and hands
+# the durable candidate back to review.
 set -euo pipefail
 
 BEAD_ID="${1:-}"
-if [ -z "$BEAD_ID" ]; then
-    echo "candidate-review-repair-worker: bead id is required" >&2
+EXPECTED_TOKEN="${GC_CANDIDATE_REPAIR_TOKEN:-}"
+if [ -z "$BEAD_ID" ] || ! [[ "$BEAD_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "candidate-review-repair-worker: a path-safe bead id is required" >&2
+    exit 1
+fi
+if [ -z "$EXPECTED_TOKEN" ]; then
+    echo "candidate-review-repair-worker: GC_CANDIDATE_REPAIR_TOKEN is required" >&2
     exit 1
 fi
 if ! command -v jq >/dev/null 2>&1; then
@@ -21,133 +27,250 @@ if [ -z "${GC_AGENT:-}" ]; then
     exit 1
 fi
 
+read_bead() {
+    local result
+    result="$(gc bd show "$BEAD_ID" --json)" || return 1
+    printf '%s' "$result" | jq -e 'type == "array" and length == 1' >/dev/null 2>&1 || return 1
+    printf '%s' "$result" | jq -c '.[0]'
+}
+
+read_meta() {
+    printf '%s' "$1" | jq -r --arg key "$2" '.metadata[$key] // empty'
+}
+
+# Fail without mutation until the complete eligibility contract has been
+# checked. This is what keeps human, external, stale, and malformed holds
+# genuinely untouched even if a caller invokes the worker directly.
+BEAD="$(read_bead)" || {
+    echo "candidate-review-repair-worker: unable to read an unambiguous $BEAD_ID" >&2
+    exit 1
+}
+STATUS="$(printf '%s' "$BEAD" | jq -r '.status // empty')"
+ASSIGNEE="$(printf '%s' "$BEAD" | jq -r '.assignee // empty')"
+HOLD_CLASS="$(read_meta "$BEAD" gc.candidate_review_hold_class)"
+STATE="$(read_meta "$BEAD" gc.candidate_review_state)"
+TOKEN="$(read_meta "$BEAD" gc.candidate_review_token)"
+OWNER="$(read_meta "$BEAD" gc.candidate_review_owner)"
+REPAIR_ROUTE="$(read_meta "$BEAD" gc.candidate_review_repair_route)"
+REVIEW_ROUTE="$(read_meta "$BEAD" gc.candidate_review_review_route)"
+TARGET_BRANCH="$(read_meta "$BEAD" gc.candidate_review_target)"
+SOURCE_BRANCH="$(read_meta "$BEAD" gc.candidate_review_source)"
+WORK_DIR="${GC_CANDIDATE_REPAIR_WORK_DIR:-}"
+ATTEMPT="$(read_meta "$BEAD" gc.candidate_review_repair_attempt)"
+MAX_ATTEMPTS="$(read_meta "$BEAD" gc.candidate_review_max_attempts)"
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+if [ "$HOLD_CLASS" != "mechanical" ] || { [ "$STATE" != "queued" ] && [ "$STATE" != "active" ]; }; then
+    echo "candidate-review-repair-worker: hold is not an explicit queued mechanical candidate" >&2
+    exit 1
+fi
+if [ "$TOKEN" != "$EXPECTED_TOKEN" ] || [ "$ASSIGNEE" != "$GC_AGENT" ]; then
+    echo "candidate-review-repair-worker: repair token or owner is stale" >&2
+    exit 1
+fi
+if [ -z "$OWNER" ] || [ "$OWNER" != "$REPAIR_ROUTE" ] || [ -z "$REVIEW_ROUTE" ] || \
+    [ -z "$TARGET_BRANCH" ] || [ -z "$SOURCE_BRANCH" ]; then
+    echo "candidate-review-repair-worker: candidate contract is incomplete or inconsistent" >&2
+    exit 1
+fi
+if [ -z "$WORK_DIR" ]; then
+    echo "candidate-review-repair-worker: trusted formula worktree is missing" >&2
+    exit 1
+fi
+if ! [[ "$ATTEMPT" =~ ^[1-9][0-9]*$ && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || [ "$ATTEMPT" -gt "$MAX_ATTEMPTS" ]; then
+    echo "candidate-review-repair-worker: repair attempt is invalid or exhausted" >&2
+    exit 1
+fi
+if ! printf '%s' "$BEAD" | jq -e '.metadata | has("gc.candidate_review_residue") and has("gc.candidate_review_landed")' >/dev/null 2>&1; then
+    echo "candidate-review-repair-worker: candidate contract lacks explicit path lists" >&2
+    exit 1
+fi
+if ! git check-ref-format --branch "$SOURCE_BRANCH" >/dev/null 2>&1 || \
+    ! git check-ref-format --branch "$TARGET_BRANCH" >/dev/null 2>&1 || \
+    [ "$SOURCE_BRANCH" = "$TARGET_BRANCH" ]; then
+    echo "candidate-review-repair-worker: source and target must be distinct valid branches" >&2
+    exit 1
+fi
+if [ ! -d "$WORK_DIR" ]; then
+    echo "candidate-review-repair-worker: candidate worktree does not exist: $WORK_DIR" >&2
+    exit 1
+fi
+
+cd "$WORK_DIR"
+WORK_TOP="$(pwd -P)"
+GIT_TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "candidate-review-repair-worker: work directory is not a Git worktree" >&2
+    exit 1
+}
+GIT_TOP="$(cd "$GIT_TOP" && pwd -P)"
+if [ "$WORK_TOP" != "$GIT_TOP" ]; then
+    echo "candidate-review-repair-worker: work directory must be the Git top-level" >&2
+    exit 1
+fi
+CURRENT_BRANCH="$(git branch --show-current)"
+if [ "$CURRENT_BRANCH" != "$SOURCE_BRANCH" ]; then
+    echo "candidate-review-repair-worker: trusted worktree is not on the declared source branch" >&2
+    exit 1
+fi
+if [ -n "$(git status --porcelain=v1)" ]; then
+    echo "candidate-review-repair-worker: candidate worktree is dirty; preserving foreign or uncertain work" >&2
+    exit 1
+fi
+
+# Serialize all Git mutation for this source bead. A dead same-host owner can be
+# reclaimed; a live or remote-host owner is preserved rather than guessed dead.
+GIT_COMMON="$(git rev-parse --git-common-dir)"
+case "$GIT_COMMON" in /*) ;; *) GIT_COMMON="$WORK_TOP/$GIT_COMMON" ;; esac
+GIT_COMMON="$(cd "$GIT_COMMON" && pwd -P)"
+LOCK_ROOT="$GIT_COMMON/gc-candidate-review-locks"
+# One writer per repository. Different beads may target the same worktree or
+# source branch, so a bead-scoped lock would not prevent cross-bead Git races.
+LOCK_DIR="$LOCK_ROOT/writer"
+mkdir -p "$LOCK_ROOT"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    lock_host="$(cat "$LOCK_DIR/host" 2>/dev/null || true)"
+    lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ "$lock_host" = "$(hostname)" ] && [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        rm -rf -- "$LOCK_DIR"
+        mkdir "$LOCK_DIR" || {
+            echo "candidate-review-repair-worker: repair lock could not be reclaimed" >&2
+            exit 1
+        }
+    else
+        echo "candidate-review-repair-worker: another repair writer owns $BEAD_ID" >&2
+        exit 1
+    fi
+fi
+printf '%s\n' "$(hostname)" >"$LOCK_DIR/host"
+printf '%s\n' "$$" >"$LOCK_DIR/pid"
+printf '%s\n' "$EXPECTED_TOKEN" >"$LOCK_DIR/token"
+cleanup_lock() {
+    if [ "$(cat "$LOCK_DIR/token" 2>/dev/null || true)" = "$EXPECTED_TOKEN" ]; then
+        rm -rf -- "$LOCK_DIR"
+    fi
+}
+trap cleanup_lock EXIT INT TERM
+
+fresh_guarded_update() {
+    local fresh fresh_token fresh_status fresh_assignee
+    fresh="$(read_bead)" || return 1
+    fresh_token="$(read_meta "$fresh" gc.candidate_review_token)"
+    [ "$fresh_token" = "$EXPECTED_TOKEN" ] || return 13
+    fresh_status="$(printf '%s' "$fresh" | jq -r '.status // empty')"
+    fresh_assignee="$(printf '%s' "$fresh" | jq -r '.assignee // empty')"
+    [ "$fresh_assignee" = "$GC_AGENT" ] || return 13
+    gc bd update "$BEAD_ID" --if-status "$fresh_status" --if-assignee "$fresh_assignee" "$@"
+}
+
+token_guarded_update() {
+    local fresh fresh_token fresh_status fresh_assignee
+    fresh="$(read_bead)" || return 1
+    fresh_token="$(read_meta "$fresh" gc.candidate_review_token)"
+    [ "$fresh_token" = "$EXPECTED_TOKEN" ] || return 13
+    fresh_status="$(printf '%s' "$fresh" | jq -r '.status // empty')"
+    fresh_assignee="$(printf '%s' "$fresh" | jq -r '.assignee // empty')"
+    gc bd update "$BEAD_ID" --if-status "$fresh_status" --if-assignee "$fresh_assignee" "$@"
+}
+
 fail_state() {
     local reason="$1"
-    if ! gc bd update "$BEAD_ID" \
+    if ! fresh_guarded_update \
         --set-metadata gc.candidate_review_state=repair_failed \
         --set-metadata gc.candidate_review_last_error="$reason" \
         --append-notes "Candidate repair stopped safely: $reason" >/dev/null; then
-        echo "candidate-review-repair-worker: failed to persist repair failure: $reason" >&2
+        echo "candidate-review-repair-worker: newer ownership prevented stale failure evidence" >&2
     fi
     echo "candidate-review-repair-worker: $reason" >&2
     return 1
 }
 
-BEAD_JSON=""
-if ! BEAD_JSON="$(gc bd show "$BEAD_ID" --json)"; then
-    echo "candidate-review-repair-worker: unable to read $BEAD_ID" >&2
+if ! fresh_guarded_update \
+    --set-metadata gc.candidate_review_state=active \
+    --set-metadata gc.candidate_review_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null; then
+    echo "candidate-review-repair-worker: worker ownership changed before repair started" >&2
     exit 1
 fi
-if ! printf '%s' "$BEAD_JSON" | jq -e 'type == "array" and length == 1' >/dev/null 2>&1; then
-    fail_state "bead lookup returned malformed or ambiguous JSON" || exit 1
-fi
-BEAD="$(printf '%s' "$BEAD_JSON" | jq -c '.[0]')"
 
-# Claim is idempotent for the routed worker and prevents a second repair writer
-# from entering the worktree. The pack order's claim already fenced the route;
-# this second claim is the worker boundary and is intentionally explicit.
-if ! gc bd update "$BEAD_ID" --claim >/dev/null; then
-    fail_state "worker could not claim source bead" || exit 1
-fi
-
-read_meta() {
-    printf '%s' "$BEAD" | jq -r --arg key "$1" '.metadata[$key] // empty'
-}
-
-HOLD_CLASS="$(read_meta gc.candidate_review_hold_class)"
-STATE="$(read_meta gc.candidate_review_state)"
-OWNER="$(read_meta gc.candidate_review_owner)"
-REPAIR_ROUTE="$(read_meta gc.candidate_review_repair_route)"
-REVIEW_ROUTE="$(read_meta gc.candidate_review_review_route)"
-TARGET_BRANCH="$(read_meta gc.candidate_review_target)"
-SOURCE_BRANCH="$(read_meta gc.candidate_review_source)"
-WORK_DIR="$(read_meta gc.work_dir)"
-if [ "$HOLD_CLASS" != "mechanical" ] || { [ "$STATE" != "queued" ] && [ "$STATE" != "active" ]; }; then
-    fail_state "hold is no longer an explicit queued mechanical candidate" || exit 1
-fi
-if [ -z "$OWNER" ] || [ -z "$REPAIR_ROUTE" ] || [ -z "$REVIEW_ROUTE" ] || [ -z "$TARGET_BRANCH" ] || [ -z "$SOURCE_BRANCH" ] || [ -z "$WORK_DIR" ]; then
-    fail_state "candidate contract is missing owner, routes, source, target, or worktree" || exit 1
-fi
-if ! printf '%s' "$BEAD" | jq -e '.metadata | has("gc.candidate_review_residue") and has("gc.candidate_review_landed")' >/dev/null 2>&1; then
-    fail_state "candidate contract is missing explicit residue and landed path lists" || exit 1
-fi
-if [ "$OWNER" != "$REPAIR_ROUTE" ]; then
-    fail_state "candidate correction owner does not match repair route" || exit 1
-fi
-
-if ! git check-ref-format --branch "$SOURCE_BRANCH" >/dev/null 2>&1; then
-    fail_state "candidate source is not a valid branch name" || exit 1
-fi
-if ! git check-ref-format --branch "$TARGET_BRANCH" >/dev/null 2>&1; then
-    fail_state "candidate target is not a valid branch name" || exit 1
-fi
-if [ ! -d "$WORK_DIR" ]; then
-    fail_state "candidate worktree does not exist: $WORK_DIR" || exit 1
-fi
-cd "$WORK_DIR"
-if [ -n "$(git status --porcelain=v1)" ]; then
-    fail_state "candidate worktree is dirty; preserving foreign or uncertain work" || exit 1
-fi
-
-RESIDUE_JSON="$(read_meta gc.candidate_review_residue)"
-LANDED_JSON="$(read_meta gc.candidate_review_landed)"
-RESIDUE_JSON="${RESIDUE_JSON:-[]}"
-LANDED_JSON="${LANDED_JSON:-[]}"
+RESIDUE_JSON="$(read_meta "$BEAD" gc.candidate_review_residue)"
+LANDED_JSON="$(read_meta "$BEAD" gc.candidate_review_landed)"
 validate_paths() {
     local label="$1" value="$2"
-    if ! printf '%s' "$value" | jq -e 'type == "array" and all(.[]; type == "string" and length > 0 and (startswith("/") | not) and (contains("..") | not) and . != "." and . != ".git" and (startswith(".git/") | not))' >/dev/null 2>&1; then
-        fail_state "$label contains invalid absolute, traversal, git-internal, or non-string path" || exit 1
+    if ! printf '%s' "$value" | jq -e '
+        type == "array" and all(.[];
+            type == "string" and length > 0 and
+            (explode | all(.[]; . >= 32 and . != 127)) and
+            (startswith("/") | not) and
+            (endswith("/") | not) and
+            ((split("/")) as $parts | all($parts[]; . != "" and . != "." and . != "..")) and
+            . != ".git" and (startswith(".git/") | not)
+        )
+    ' >/dev/null 2>&1; then
+        fail_state "$label contains an invalid, control-character, absolute, traversal, or git-internal path" || exit 1
     fi
 }
 validate_paths residue "$RESIDUE_JSON"
 validate_paths landed "$LANDED_JSON"
+
+has_symlink_component() {
+    local path="$1" rest="$1" prefix="" component
+    while :; do
+        component="${rest%%/*}"
+        [ -n "$prefix" ] && prefix="$prefix/$component" || prefix="$component"
+        [ -L "$prefix" ] && return 0
+        [ "$rest" = "$component" ] && break
+        rest="${rest#*/}"
+    done
+    return 1
+}
+check_local_path_safety() {
+    local path
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if has_symlink_component "$path"; then
+            fail_state "declared path traverses a symlink: $path" || exit 1
+        fi
+    done
+}
+check_target_path_safety() {
+    local path mode
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        mode="$(git ls-tree "$TARGET_REF" -- "$path" | awk 'NR == 1 {print $1}')"
+        if [ "$mode" = "120000" ]; then
+            fail_state "declared target path is a symlink: $path" || exit 1
+        fi
+    done
+}
+
+check_local_path_safety < <(printf '%s\n%s' "$RESIDUE_JSON" "$LANDED_JSON" | jq -sr 'add | unique[]')
 
 if ! git fetch --prune origin "refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \
     "refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" >/dev/null 2>&1; then
     fail_state "unable to fetch candidate and target refs from origin" || exit 1
 fi
 TARGET_REF="refs/remotes/origin/$TARGET_BRANCH"
-if ! git show-ref --verify --quiet "$TARGET_REF"; then
-    fail_state "fetched target ref is missing: $TARGET_BRANCH" || exit 1
+SOURCE_REF="refs/remotes/origin/$SOURCE_BRANCH"
+if ! git show-ref --verify --quiet "$TARGET_REF" || ! git show-ref --verify --quiet "$SOURCE_REF"; then
+    fail_state "fetched candidate or target ref is missing" || exit 1
 fi
-if ! git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_BRANCH"; then
-    fail_state "fetched candidate ref is missing: $SOURCE_BRANCH" || exit 1
-fi
+check_target_path_safety < <(printf '%s\n%s' "$RESIDUE_JSON" "$LANDED_JSON" | jq -sr 'add | unique[]')
 
-CURRENT_BRANCH="$(git branch --show-current)"
-if [ "$CURRENT_BRANCH" != "$SOURCE_BRANCH" ]; then
-    if git show-ref --verify --quiet "refs/heads/$SOURCE_BRANCH"; then
-        if ! git switch "$SOURCE_BRANCH" >/dev/null 2>&1; then
-            fail_state "candidate branch is owned by another worktree" || exit 1
-        fi
-    else
-        if ! git switch --create "$SOURCE_BRANCH" "refs/remotes/origin/$SOURCE_BRANCH" >/dev/null 2>&1; then
-            fail_state "could not enter candidate branch" || exit 1
-        fi
-    fi
+if ! git merge-base --is-ancestor "$SOURCE_REF" HEAD; then
+    fail_state "local candidate does not descend from the observed remote candidate" || exit 1
 fi
-
 TARGET_COMMIT="$(git rev-parse "$TARGET_REF")"
-if ! gc bd update "$BEAD_ID" --if-status in_progress --if-assignee "$GC_AGENT" \
-    --set-metadata gc.candidate_review_state=active \
-    --set-metadata gc.candidate_review_target_commit="$TARGET_COMMIT" \
-    --set-metadata gc.candidate_review_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null; then
-    fail_state "worker claim was lost before repair started" || exit 1
-fi
 
 remove_explicit_paths() {
     local path
     while IFS= read -r path; do
         [ -n "$path" ] || continue
+        if has_symlink_component "$path"; then
+            fail_state "declared residue traverses a symlink: $path" || exit 1
+        fi
         if [ -e "$path" ] || [ -L "$path" ]; then
             if [ -d "$path" ] && [ ! -L "$path" ]; then
                 fail_state "declared residue is a directory, refusing recursive deletion: $path" || exit 1
             fi
-            if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
-                git rm -f -- "$path" >/dev/null
-            else
-                rm -f -- "$path"
-            fi
+            rm -f -- "$path"
         fi
     done < <(printf '%s' "$RESIDUE_JSON" | jq -r '.[]')
 }
@@ -155,26 +278,32 @@ restore_explicit_paths() {
     local path
     while IFS= read -r path; do
         [ -n "$path" ] || continue
-        if ! git cat-file -e "$TARGET_REF:$path" >/dev/null 2>&1; then
+        if has_symlink_component "$path"; then
+            fail_state "declared landed path traverses a symlink: $path" || exit 1
+        fi
+        git cat-file -e "$TARGET_REF:$path" >/dev/null 2>&1 || {
             fail_state "declared already-landed path is absent from target: $path" || exit 1
-        fi
-        if ! git restore --source="$TARGET_REF" -- "$path"; then
+        }
+        git restore --source="$TARGET_REF" -- "$path" || {
             fail_state "could not omit already-landed path from candidate: $path" || exit 1
-        fi
+        }
     done < <(printf '%s' "$LANDED_JSON" | jq -r '.[]')
 }
 remove_explicit_paths
 restore_explicit_paths
-
-if [ -n "$(git status --porcelain=v1)" ]; then
-    git add -A
-    if ! git diff --cached --quiet; then
-        git commit -m "chore: repair candidate review hold" >/dev/null
-    fi
+while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    git add -A -- "$path"
+done < <(printf '%s\n%s' "$RESIDUE_JSON" "$LANDED_JSON" | jq -sr 'add | unique[]')
+if ! git diff --cached --quiet; then
+    git commit -m "chore: repair candidate review hold" >/dev/null
 fi
-if ! git rebase "$TARGET_REF" >/dev/null 2>&1; then
-    git rebase --abort >/dev/null 2>&1 || true
-    fail_state "candidate cannot be rebased mechanically onto current target" || exit 1
+if [ -n "$(git status --porcelain=v1)" ]; then
+    fail_state "undeclared worktree changes appeared during repair; preserving them" || exit 1
+fi
+if ! git merge --no-edit "$TARGET_REF" >/dev/null 2>&1; then
+    git merge --abort >/dev/null 2>&1 || true
+    fail_state "candidate cannot mechanically integrate the current target" || exit 1
 fi
 
 GATE_EVIDENCE=""
@@ -182,9 +311,9 @@ GATES_BASE_COMMIT="$(git rev-parse HEAD)"
 run_gate() {
     local name="$1" command_value="$2"
     [ -n "$command_value" ] || return 0
-    if ! sh -c "$command_value"; then
+    sh -c "$command_value" || {
         fail_state "configured $name gate failed" || exit 1
-    fi
+    }
     GATE_EVIDENCE="${GATE_EVIDENCE}${name}=passed;"
 }
 run_gate setup "${GC_CANDIDATE_REPAIR_SETUP_COMMAND:-}"
@@ -199,8 +328,6 @@ if [ -n "$(git status --porcelain=v1)" ] || [ "$(git rev-parse HEAD)" != "$GATES
     fail_state "configured gates changed the candidate worktree; preserving the unreviewed changes" || exit 1
 fi
 
-# Do not publish if target moved during repair or gates. This is a fresh fetch,
-# not a read of a local tracking ref that may be stale.
 if ! git fetch origin "refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" >/dev/null 2>&1; then
     fail_state "unable to refresh target before publication" || exit 1
 fi
@@ -208,38 +335,41 @@ CURRENT_TARGET_COMMIT="$(git rev-parse "$TARGET_REF")"
 if [ "$CURRENT_TARGET_COMMIT" != "$TARGET_COMMIT" ]; then
     fail_state "target moved during repair; candidate was not published" || exit 1
 fi
-
 REMOTE_BEFORE="$(git ls-remote origin "refs/heads/$SOURCE_BRANCH" | awk 'NR == 1 {print $1}')"
-if [ -z "$REMOTE_BEFORE" ]; then
-    fail_state "candidate remote branch disappeared before publication" || exit 1
+if [ -z "$REMOTE_BEFORE" ] || [ "$REMOTE_BEFORE" != "$(git rev-parse "$SOURCE_REF")" ]; then
+    fail_state "candidate remote moved or disappeared before publication" || exit 1
 fi
 CANDIDATE_COMMIT="$(git rev-parse HEAD)"
-if ! git push --force-with-lease="refs/heads/$SOURCE_BRANCH:$REMOTE_BEFORE" origin "HEAD:refs/heads/$SOURCE_BRANCH" >/dev/null 2>&1; then
-    fail_state "candidate push lost its remote lease" || exit 1
+if ! git merge-base --is-ancestor "$REMOTE_BEFORE" "$CANDIDATE_COMMIT"; then
+    fail_state "repaired candidate is not a fast-forward of the remote candidate" || exit 1
+fi
+if ! git push origin "HEAD:refs/heads/$SOURCE_BRANCH" >/dev/null 2>&1; then
+    fail_state "candidate publication was not a normal fast-forward" || exit 1
 fi
 
-if ! gc bd update "$BEAD_ID" \
-    --set-metadata gc.candidate_review_state=published_pending_review \
+if ! fresh_guarded_update \
+    --set-metadata gc.candidate_review_state=review_queued \
     --set-metadata gc.candidate_review_candidate_commit="$CANDIDATE_COMMIT" \
     --set-metadata gc.candidate_review_target_commit="$TARGET_COMMIT" \
     --set-metadata gc.candidate_review_gate_result=passed \
     --set-metadata gc.candidate_review_gate_evidence="$GATE_EVIDENCE" \
-    --set-metadata gc.candidate_review_published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null; then
-    echo "candidate-review-repair-worker: pushed $CANDIDATE_COMMIT but could not persist publication evidence" >&2
+    --set-metadata gc.candidate_review_published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --set-metadata gc.candidate_review_review_queued_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" >/dev/null; then
+    echo "candidate-review-repair-worker: pushed $CANDIDATE_COMMIT but ownership changed before evidence persisted" >&2
     exit 1
 fi
-
 if ! REVIEW_OUTPUT="$(gc sling "$REVIEW_ROUTE" "$BEAD_ID" --no-formula --reassign 2>&1)"; then
-    gc bd update "$BEAD_ID" --set-metadata gc.candidate_review_last_error="review handoff failed: $REVIEW_OUTPUT" \
-        --append-notes "Candidate is durable at $CANDIDATE_COMMIT; review handoff remains pending." >/dev/null
+    fresh_guarded_update \
+        --set-metadata gc.candidate_review_state=published_pending_review \
+        --set-metadata gc.candidate_review_last_error="review handoff failed: $REVIEW_OUTPUT" \
+        --append-notes "Candidate is durable at $CANDIDATE_COMMIT; review handoff remains pending." >/dev/null || true
     echo "candidate-review-repair-worker: durable candidate $CANDIDATE_COMMIT awaits review handoff: $REVIEW_OUTPUT" >&2
     exit 1
 fi
-if ! gc bd update "$BEAD_ID" \
+if ! token_guarded_update \
     --set-metadata gc.candidate_review_state=resubmitted \
     --set-metadata gc.candidate_review_review_submitted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --unset-metadata gc.candidate_review_last_error >/dev/null; then
-    echo "candidate-review-repair-worker: review was routed but evidence update failed" >&2
-    exit 1
+    echo "candidate-review-repair-worker: review was routed; newer ownership prevented stale evidence" >&2
 fi
 echo "candidate-review-repair-worker: published $CANDIDATE_COMMIT and resubmitted $BEAD_ID to $REVIEW_ROUTE"

@@ -234,14 +234,40 @@ test_candidate_review_repair_is_bounded_and_fail_closed() {
         fail "candidate-review repair formula must require an explicit mechanical hold"
     grep -F 'gc.candidate_review_max_attempts' "$router" >/dev/null ||
         fail "candidate-review repair must enforce a finite attempt budget"
+    grep -F 'max_attempts = 1' "$formula" >/dev/null ||
+        fail "formula retries must not bypass the order-owned attempt budget"
     grep -F -- '--if-status "$status" --if-assignee "$assignee"' "$router" >/dev/null ||
         fail "candidate-review repair must use a status-and-owner CAS claim"
+    grep -F -- '--status in_progress --assignee "$claim_token"' "$router" >/dev/null ||
+        fail "candidate-review repair CAS must change ownership to a unique claim token"
+    [[ $(grep -c 'gc.candidate_review_hold_class)" = "mechanical"' "$router") -ge 2 ]] ||
+        fail "repair and review routing must validate mechanical hold class before mutation"
     grep -F 'candidate worktree is dirty; preserving foreign or uncertain work' "$worker" >/dev/null ||
         fail "candidate-review repair must preserve dirty or uncertain work"
-    grep -F -- '--force-with-lease="refs/heads/$SOURCE_BRANCH:$REMOTE_BEFORE"' "$worker" >/dev/null ||
-        fail "candidate publication must be fenced by the exact observed remote head"
+    grep -F 'WORK_DIR="${GC_CANDIDATE_REPAIR_WORK_DIR:-}"' "$worker" >/dev/null ||
+        fail "candidate-review repair must bind Git mutation to the trusted formula worktree"
+    ! grep -F 'read_meta "$BEAD" gc.work_dir' "$worker" >/dev/null ||
+        fail "candidate-review repair must not trust a bead-supplied repository path"
+    grep -F 'LOCK_DIR="$LOCK_ROOT/writer"' "$worker" >/dev/null ||
+        fail "candidate-review repair must serialize all writers in one repository"
+    grep -F '(explode | all(.[]; . >= 32 and . != 127))' "$worker" >/dev/null ||
+        fail "candidate-review repair paths must reject control-character splitting"
+    grep -F 'has_symlink_component' "$worker" >/dev/null ||
+        fail "candidate-review repair paths must reject symlink escapes"
+    grep -F 'git add -A -- "$path"' "$worker" >/dev/null ||
+        fail "candidate-review repair must stage only declared paths"
+    ! grep -E '^[[:space:]]*git add -A[[:space:]]*$' "$worker" >/dev/null ||
+        fail "candidate-review repair must not stage the entire worktree"
+    grep -F 'git push origin "HEAD:refs/heads/$SOURCE_BRANCH"' "$worker" >/dev/null ||
+        fail "candidate publication must use a normal fast-forward push"
+    ! grep -F -- '--force' "$worker" >/dev/null ||
+        fail "candidate publication must never rewrite remote history"
     grep -F 'target moved during repair; candidate was not published' "$worker" >/dev/null ||
         fail "candidate publication must stop when the target moves"
+    grep -F 'test_command="${GC_CANDIDATE_REPAIR_TEST_COMMAND:-git diff --check}"' "$router" >/dev/null ||
+        fail "candidate repair must always receive an operator-owned default gate"
+    ! grep -E 'read_meta .*candidate_review_(setup|typecheck|lint|test|build)_command' "$router" >/dev/null ||
+        fail "candidate repair must not execute bead-authored gate commands"
     grep -F 'no configured repair gates were supplied' "$worker" >/dev/null ||
         fail "candidate repair must refuse publication without configured gates"
 }
