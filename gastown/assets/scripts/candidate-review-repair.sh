@@ -197,8 +197,8 @@ route_repair() {
         return 1
     fi
 
-    if ! output="$(gc sling "$route" "$id" --on "$workflow" --no-convoy --reassign \
-        --var "bead_id=$id" --var "repair_script=$WORKER" --var "repair_token=$claim_token" \
+    if ! output="$(gc sling "$route" "$id" --on "$workflow" --reassign \
+        --var "repair_script=$WORKER" --var "repair_token=$claim_token" \
         --var "setup_command=$setup" --var "typecheck_command=$typecheck" \
         --var "lint_command=$lint" --var "test_command=$test_command" \
         --var "build_command=$build" 2>&1)"; then

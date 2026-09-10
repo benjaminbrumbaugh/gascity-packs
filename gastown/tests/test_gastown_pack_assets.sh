@@ -236,6 +236,14 @@ test_candidate_review_repair_is_bounded_and_fail_closed() {
         fail "candidate-review repair must enforce a finite attempt budget"
     grep -F 'max_attempts = 1' "$formula" >/dev/null ||
         fail "formula retries must not bypass the order-owned attempt budget"
+    grep -F '{{convoy_id}}' "$formula" >/dev/null ||
+        fail "candidate-review repair formula must use its Graph v2 convoy binding"
+    ! grep -F '[vars.bead_id]' "$formula" >/dev/null ||
+        fail "candidate-review repair formula must not declare a legacy source-bead variable"
+    ! grep -F -- '--no-convoy' "$router" >/dev/null ||
+        fail "candidate-review repair routing must create the Graph v2 convoy binding"
+    ! grep -F -- '--var "bead_id=' "$router" >/dev/null ||
+        fail "candidate-review repair routing must not pass a legacy source-bead variable"
     grep -F -- '--if-status "$status" --if-assignee "$assignee"' "$router" >/dev/null ||
         fail "candidate-review repair must use a status-and-owner CAS claim"
     grep -F -- '--status in_progress --assignee "$claim_token"' "$router" >/dev/null ||

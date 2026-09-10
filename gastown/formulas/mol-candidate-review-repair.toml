@@ -12,10 +12,6 @@ formula = "mol-candidate-review-repair"
 formula_compiler = ">=2.0.0"
 
 [vars]
-[vars.bead_id]
-description = "Source candidate-review bead selected by the pack order"
-required = true
-
 [vars.repair_script]
 description = "Absolute path to the pack's mechanical repair worker"
 required = true
@@ -48,8 +44,9 @@ default = ""
 id = "repair-candidate-review"
 title = "Apply the declared correction and publish a repaired candidate"
 description = """
-Work only on source bead `{{bead_id}}`. The pack order selected this bead
-because it explicitly declared `gc.candidate_review_hold_class=mechanical`.
+Work only on the one source bead tracked by convoy `{{convoy_id}}`. The pack
+order selected this bead because it explicitly declared
+`gc.candidate_review_hold_class=mechanical`.
 Human, external, foreign, uncertain, malformed, or missing-contract holds are
 fail-closed and must remain untouched.
 
@@ -57,7 +54,12 @@ First read the source bead and verify that the order's claim token is still
 current. Do not mutate a stale or ineligible source bead:
 
 ```bash
-BEAD_ID='{{bead_id}}'
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+if [ -z "$BEAD_ID" ]; then
+    echo "candidate-review repair requires exactly one source bead" >&2
+    exit 1
+fi
 gc bd show "$BEAD_ID" --json | jq '.[0] | {id, status, assignee, metadata}'
 ```
 
