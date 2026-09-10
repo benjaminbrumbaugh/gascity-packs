@@ -239,6 +239,8 @@ test_candidate_review_repair_is_bounded_and_fail_closed() {
         fail "candidate-review repair dispatch must have a finite attempt budget"
     grep -F 'WORKFLOW="mol-candidate-review-repair"' "$router" >/dev/null ||
         fail "candidate-review repair must pin the pack-owned workflow"
+    grep -F '"$review_route" != "$route"' "$router" >/dev/null ||
+        fail "candidate-review repair must use a distinct independent review route"
     grep -F 'gc bd create --silent --parent' "$router" >/dev/null ||
         fail "candidate-review repair must create a separate generation task"
     grep -F 'max_attempts = 1' "$formula" >/dev/null ||

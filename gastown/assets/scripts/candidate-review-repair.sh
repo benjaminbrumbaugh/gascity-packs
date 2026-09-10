@@ -66,6 +66,7 @@ route_generation() {
     [[ "$route" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
     [[ "$review_route" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
     [ "$(read_meta "$source" gc.candidate_review_owner)" = "$route" ] || return 0
+    [ "$review_route" != "$route" ] || return 0
     [[ "$source_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
     [[ "$target_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$ ]] || return 0
     git check-ref-format --branch "$source_branch" >/dev/null 2>&1 || return 0
