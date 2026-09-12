@@ -216,6 +216,68 @@ if verify >= metadata:
 PY
 }
 
+test_refinery_wisp_lifecycle_uses_reconcile_guard() {
+    local prompt propulsion reconcile_calls current_wisp probes burns startup pour
+    prompt="$GASTOWN/agents/refinery/prompt.template.md"
+    propulsion="$GASTOWN/template-fragments/propulsion.template.md"
+
+    reconcile_calls="$(grep -cF 'witness-wisp-reconcile.sh' "$prompt")"
+    [[ "$reconcile_calls" -ge 5 ]] ||
+        fail "refinery prompt should route startup and both lifecycle rules through reconcile"
+    grep -F -- '--startup --formula mol-refinery-patrol' "$prompt" >/dev/null ||
+        fail "refinery startup must reconcile before considering a pour"
+    [[ "$(grep -cF -- '--current-wisp "$GC_BEAD_ID"' "$prompt")" -eq 2 ]] ||
+        fail "both lifecycle rules must pass the current wisp explicitly when available"
+    ! grep -F '{{ .AssignedInProgressQuery }}' "$prompt" >/dev/null ||
+        fail "refinery startup must not use the generated in-progress wisp probe"
+    probes="$(grep -E -c 'gc bd list .*--status[ =]in_progress' "$prompt" || true)"
+    [[ "$probes" -eq 0 ]] ||
+        fail "refinery prompt must not contain an in-progress wisp lookup"
+    current_wisp="$(grep -cF 'CURRENT_WISP' "$prompt" || true)"
+    [[ "$current_wisp" -eq 0 ]] ||
+        fail "refinery prompt must not open-code current-wisp discovery"
+    burns="$(grep -cF 'gc bd mol burn' "$prompt" || true)"
+    [[ "$burns" -eq 0 ]] ||
+        fail "refinery prompt must not open-code wisp burning"
+    grep -F 'if [ -z "$WISP" ]; then' "$prompt" >/dev/null ||
+        fail "refinery startup must pour only after reconcile returns no wisp"
+    grep -F 'Startup wisp reconciliation failed; refusing to pour.' "$prompt" >/dev/null ||
+        fail "refinery startup must fail closed on reconcile errors"
+
+    python3 - "$propulsion" <<'PY' || fail "refinery propulsion must not expand an unsafe generated wisp query"
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index('{{ define "propulsion-refinery" }}')
+end = text.index('{{ define ', start + 1)
+block = text[start:end]
+if '{{ .AssignedInProgressQuery }}' in block:
+    raise SystemExit(1)
+if 'gc bd list' in block and 'status=in_progress' in block:
+    raise SystemExit(1)
+PY
+
+    startup="$(grep -nF 'STARTUP_RESULT=' "$prompt" | cut -d: -f1)"
+    pour="$(grep -nF 'WISP=$(gc bd mol wisp' "$prompt" | cut -d: -f1)"
+    [[ "$startup" -lt "$pour" ]] ||
+        fail "refinery startup must reconcile before the initial pour"
+    python3 - "$prompt" <<'PY' || fail "refinery startup must gate the pour on reconcile status and an empty WISP"
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index("STARTUP_RESULT=")
+end = text.index("```", start)
+block = text[start:end]
+pour = block.index("WISP=$(gc bd mol wisp")
+for marker in (
+    'if [ "$RECONCILE_STATUS" -ne 0 ]; then',
+    'if [ -z "$WISP" ]; then',
+):
+    if block.index(marker) >= pour:
+        raise SystemExit(1)
+PY
+}
+
 test_prime_prompts_are_city_generic_and_compact() {
     local mayor propulsion awareness
     mayor="$GASTOWN/agents/mayor/prompt.template.md"
@@ -254,5 +316,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_refinery_wisp_lifecycle_uses_reconcile_guard
 
 echo "gastown pack asset tests passed"
