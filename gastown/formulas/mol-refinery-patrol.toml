@@ -169,10 +169,29 @@ needs = ["check-inbox"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
 
-Search for work beads assigned to you with branch metadata:
+Search for work beads assigned to you with branch metadata. Do not put a
+server-side `--status=open` filter on this query: a polecat handoff can leave
+the bead `in_progress` while the refinery owns it. Select the two valid
+handoff states locally, then verify the branch is actually on `origin` before
+surfacing it. `metadata.branch` is written before push and is not proof that a
+remote branch exists.
 ```bash
-WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
-  --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+WORK_JSON=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" \
+  --exclude-type=epic --has-metadata-key=branch --limit=0 --json 2>/dev/null || printf '[]')
+WORK=""
+while IFS=$'\t' read -r CANDIDATE BRANCH; do
+  [ -n "$CANDIDATE" ] || continue
+  if git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
+    WORK="$CANDIDATE"
+    break
+  fi
+  echo "SKIP: $CANDIDATE metadata.branch=$BRANCH is not reachable on origin"
+done < <(printf '%s' "$WORK_JSON" | jq -r '
+  .[]
+  | select(.status == "open" or .status == "in_progress")
+  | select((.metadata.branch // "") != "")
+  | [.id, .metadata.branch] | @tsv
+')
 ```
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
@@ -188,7 +207,7 @@ gc bd show $WORK --json | jq '.[0].metadata'
 The bead MUST have `metadata.branch`. If `metadata.target` is missing,
 use {{target_branch}} as default. Note the work bead ID and close this step.
 
-If NO work found:
+If NO work found (including candidates whose branch is not on `origin`):
 Write exactly:
 ```
 IDLE: no work, exiting turn.

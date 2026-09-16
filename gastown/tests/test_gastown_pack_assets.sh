@@ -254,5 +254,6 @@ test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_prime_prompts_are_city_generic_and_compact
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+bash "$GASTOWN/tests/test_refinery_discovery.sh"
 
 echo "gastown pack asset tests passed"
